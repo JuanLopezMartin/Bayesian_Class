@@ -1,0 +1,423 @@
+---
+title: "GR5065 Assignment 5"
+author: "Juan Lopez Martin"
+output: 
+  pdf_document: 
+    latex_engine: pdflatex
+    keep_tex:  true
+    number_sections: yes
+---
+
+```{r, include=FALSE, warning=FALSE}
+library(rstan)
+library(brms)
+library(ggplot2)
+library(dplyr)
+library(haven)
+library(forcats)
+library(purrr)
+library(bridgesampling)
+library(bayesplot)
+
+Sys.setenv(LOCAL_CPPFLAGS = '-march=corei7 -mtune=corei7')
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r, include=FALSE}
+library(knitr)
+
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+
+hook_output <- knit_hooks$get("output")
+knit_hooks$set(output = function(x, options) {
+  lines <- options$output.lines
+  if (is.null(lines)) {
+    return(hook_output(x, options))  # pass to default hook
+  }
+  x <- unlist(strsplit(x, "\n"))
+  more <- "..."
+  if (length(lines)==1) {        # first n lines
+    if (length(x) > lines) {
+      # truncate the output, but add ....
+      x <- c(head(x, lines), more)
+    }
+  } else {
+    x <- c(more, x[lines], more)
+  }
+  # paste these lines together
+  x <- paste(c(x, ""), collapse = "\n")
+  hook_output(x, options)
+})
+``` 
+
+# American Family Survey
+
+## Adjusting for Party Identification or Related Variables
+
+Our base regression will try to predict presidential approval based on age, race, gender, and education level. Note that the baseline levels for the categorical variables (race and gender) will be white and male.
+
+```{r, cache = TRUE}
+library(haven)
+AFS <- as_factor(read_dta("Data for Release 2018.DTA"))
+```
+
+```{r, cache = TRUE}
+AFS$age <- 2018 - AFS$birthyr
+AFS$presvote16post <- as.character(AFS$presvote16post)
+AFS$presvote16post <- ifelse(AFS$presvote16post %in% c("Gary Johnson", "Jill Stein", 
+                                                       "Evan McMullin", "Other"), 
+                             "Other", AFS$presvote16post)
+
+AFS_clean <- AFS %>% 
+  select(age, race, gender, educ, app_dtrmp, pid7, presvote16post, inputstate) %>% 
+  mutate(age = as.numeric(replace(age, age %in% c("skipped", "not asked"), NA)),
+         race = factor(replace(race, race %in% c("skipped", "not asked"), NA)),
+         gender = factor(replace(gender, gender %in% c("skipped", "not asked"), NA)),
+         educ = as.integer(factor(educ, ordered = TRUE, levels = c("No HS",
+                                                          "HS",
+                                                          "High school graduate",
+                                                          "Some college",
+                                                          "2-year",
+                                                          "4-year",
+                                                          "Post-grad"))),
+         pid = as.integer(factor(pid7, ordered = TRUE, levels = c("Strong Democrat",
+                                                        "Not very strong Democrat",
+                                                        "Lean Democrat",
+                                                        "Independent",
+                                                        "Lean Republican",
+                                                        "Not very strong Republican",
+                                                        "Strong Republican"))),
+         trump = factor(app_dtrmp, ordered = TRUE, levels = c("Strongly disapprove",
+                                                        "Somewhat disapprove",
+                                                        "Somewhat approve",
+                                                        "Strongly approve"))) %>% 
+  na.omit()
+
+```
+
+The first simple model does not include any multilevel structure or party ID variable.
+
+```{r, cache = TRUE}
+fit1 <- brm(trump ~ 1 + age + race + gender + educ, 
+            data = AFS_clean, family = cumulative(link = "logit"), 
+            prior = prior(normal(0, 2), class = "b") + 
+            prior(normal(0, 10), class = "Intercept"))
+print(fixef(fit1), digits = 1)
+```
+
+The second model allows the cutpoints and the effect of age, race, gender, and education to vary by state. 
+
+```{r, cache = TRUE, warning=FALSE}
+fit2 <- brm(trump ~ 1 + age + race + gender + educ + 
+              (1 + age + race + gender + educ | inputstate), 
+        data = AFS_clean, family = cumulative(link = "logit"), 
+        prior = prior(normal(0, 2), class = "b") + prior(normal(0, 10), class = "Intercept") +
+          prior(exponential(0.5), class = "sd") + prior(lkj_corr_cholesky(1), class = "L"), 
+        chains = 6, cores = 6, iter = 2000, control = list(adapt_delta = 0.9))
+print(fixef(fit2), digits = 1)
+```
+
+The third model includes the same predictors as the second, adding the self-reported party leaning. For simplicity, we do not allow this coefficient to vary by state. 
+
+```{r, cache = TRUE, warning=FALSE}
+fit3 <- brm(trump ~ 1 + age + race + gender + educ + 
+              (1 + age + race + gender + educ | inputstate) + pid, 
+            data = AFS_clean, family = cumulative(link = "logit"), 
+            prior = prior(normal(0, 2), class = "b") + prior(normal(0, 10), class = "Intercept") +
+              prior(exponential(0.5), class = "sd") + prior(lkj_corr_cholesky(1), class = "L"),
+            chains = 6, cores = 6, iter = 2000, control = list(adapt_delta = 0.9))
+print(fixef(fit3), digits = 1)
+```
+
+The fourth model is the same as the third, but including the self-reported vote in the previous presidential election instead of party leaning. Note that the baseline category is no vote in the previous election. 
+
+```{r, cache = TRUE, warning=FALSE}
+fit4 <- brm(trump ~ 1 + age + race + gender + educ + 
+              (1 + age + race + gender + educ | inputstate) + presvote16post, 
+            data = AFS_clean, family = cumulative(link = "logit"), 
+            prior = prior(normal(0, 2), class = "b") + prior(normal(0, 10), class = "Intercept") +
+              prior(exponential(0.5), class = "sd") + prior(lkj_corr_cholesky(1), class = "L"),
+            chains = 6, cores = 6, iter = 2000, control = list(adapt_delta = 0.9))
+print(fixef(fit4), digits = 1)
+```
+
+The fifth and last model includes all the predictors mentioned previously. Again, the party leaning and past voting behavior are not allowed to vary by state.
+
+```{r, cache = TRUE, warning=FALSE}
+fit5 <- brm(trump ~ 1 + age + race + gender + educ + 
+              (1 + age + race + gender + educ | inputstate) + pid + presvote16post, 
+            data = AFS_clean, family = cumulative(link = "logit"), 
+            prior = prior(normal(0, 2), class = "b") + prior(normal(0, 10), class = "Intercept") +
+              prior(exponential(0.5), class = "sd") + prior(lkj_corr_cholesky(1), class = "L"),
+            chains = 6, cores = 6, iter = 2000, control = list(adapt_delta = 0.9))
+print(fixef(fit5), digits = 1)
+```
+
+```{r, cache = TRUE, warning=FALSE}
+loo1 <- loo(fit1, cores = 6)
+loo2 <- loo(fit2, cores = 6)
+loo3 <- loo(fit3, cores = 6)
+loo4 <- loo(fit4, cores = 6)
+loo5 <- loo(fit5, cores = 6)
+```
+
+The ELPD for the five models make intuitive sense:
+
+```{r, cache = TRUE, warning=FALSE}
+loo_compare(loo1, loo2, loo3, loo4, loo5)
+```
+
+As expected, the fifth model is the one with the best ELPD. This is not surprising given that presidental vote in the last elections and current political leaning should be strongly connected with approval of the current administration. However, we should remember that the estimated ELPD is only a measure of out-of-sample prediction accuracy; that is, it reflects how good the model will do when trying to predict the outcome variable in a new dataset. From a prediction perspective, this (or any other out-of-sample accuracy metric) is the only thing we should care about, as often happens in a machine learning context. However, in an inferential context this is not the only element we must consider. In experiments it is often said that adjusting for post-treatment covariates can poison causal estimates. That is: if including a predictor that refers to something that have been influenced by the treatment, the estimate of the treatment effect can be biased even with random assignment. This is because variance that should be attributed to the treatment can be attributed to this post-treatment or intermediate variable.
+
+This is not an experiment, but the same reasoning applies. If we do not include a predictor that corresponds to ideological leaning or past voting behavior, the estimated coefficient for a given predictors in linear regression can be interpreted as the expected difference under the model between two people that differ in that variable but are equal in all the other covariates. For instance, the coefficient for black people should be interpreted as "comparing one black and one white person that have the same age, gender, and education, the black one has a X more/less probability of supporting Donald Trump than the white one". Of course, the model we are using is a ordinal logistic regression and thus the interpretation would be a bit more challenging due to the ordinality and non-linearity of the logit function, but the idea is the same. This should be used, for instance, if we wanted to get a general overview of the different factors that influence Smerican voters for choosing one candidate over the other. 
+
+Meanwhile, including party identification or similar variables will make this new predictor capture a lot of the variance previously attributed to other predictors, also making the prediction much more accurate. Importantly, this implies the coefficient is interpreted with the party ID (or similar variable) held constant. That is, the coefficient for blacks will be interpreted as "comparing one black person and one white person that have the same age, gender, education, and party ID, the black one will have a X more/less probability of supporting Donald Trump than the white one". Note that the comparison is for two people with the same Party ID (or past voting behavior or any other similar variable). Therefore, this is more suited if we were interested in understanding the more specific dynamics of a particular election between certain candidates.
+
+In this case, we are concerned about making predictions for the different states and therefore we will select the fifth model.
+
+Lastly, note that the state-level heterogeneity for the five different models, although there does not seem to be a consistent pattern.
+
+```{r, cache = TRUE}
+columnstoselect <- paste0("sd_inputstate__", c("age", "raceBlack", "raceHispanic","raceAsian", 
+                                              "raceNativeAmerican", "raceMixed", "raceOther", 
+                                              "raceMiddleEastern", "genderFemale", "educ"))
+
+l2 <- colMeans(as.matrix(fit2)[,columnstoselect])
+l3 <- colMeans(as.matrix(fit3)[,columnstoselect])
+l4 <- colMeans(as.matrix(fit4)[,columnstoselect])
+l5 <- colMeans(as.matrix(fit5)[,columnstoselect])
+round(data.frame("Fit2" = l2, "Fit3" = l3, "Fit4" = l4, "Fit5" = l5), 3)
+```
+## Binary or Ordinal
+
+```{r, cache = TRUE}
+AFS_clean$trump_binary <- (AFS_clean$trump %in% c("Strongly approve", "Somewhat approve")) * 1
+```
+
+We start fitting a Bernoulli model with the same predictors as in the fifth model in the previous section.
+
+```{r, cache = TRUE, warning=FALSE}
+fit_b <- brm(trump_binary ~ 1 + age + race + gender + educ + 
+               (1 + age + race + gender + educ | inputstate) + pid + presvote16post, 
+             data = AFS_clean, family = bernoulli, 
+             prior = prior(normal(0, 2), class = "b") + prior(normal(0, 10), class = "Intercept")+
+               prior(exponential(0.5), class = "sd") + prior(lkj_corr_cholesky(1), class = "L"),
+             chains = 6, cores = 6, iter = 2000, control = list(adapt_delta = 0.9))
+
+loob <- loo(fit_b)
+```
+
+I understand the code in section 1.2 of the assignment was incorrect, at least for my data. To get the correct loo estimate for the ordinal regression in the binary classification task we need to transpose the matrix that results from the pp_expect function which goes to the prob argument of dbinom. Then, it has to be transposed again to be fed into loo (which takes a S by N matrix). I provided a minimal working example of this problem in thread #501 on CampusWire, but the main problem is that dbinom applies, by default, the transformation columnwise instead of rowise.
+
+```{r, cache = TRUE, warning=FALSE}
+Pr <- pp_expect(fit5)
+# 3 and 4 instead of 1 and 2 because I reversed the variable so higher numbers mean higher approval
+lmatrix <- apply(Pr, MARGIN = 1:2, FUN = function(p) p[3] + p[4]) 
+ll <- t(dbinom(x = AFS_clean$trump_binary, size = 1, log = TRUE, prob = t(lmatrix)))
+
+looll <- loo(ll, cores = 6)
+```
+
+```{r, cache = TRUE, warning=FALSE}
+loo_compare(looll, loob)
+```
+
+It seems that the Bernoulli model performed slightly worse than the ordinal logistic regression on the binary classification task. This is not particularly surprising, considering that the ordinal logistic regression was based on a more detailed outcome (i.e. whether the responded approved/disapproved to a greater or smaller extent) that was simplified for the binary logistic regression. If the extra information is relevant it should performance,as it appears to happen in this case to a small degree. The tendency to remove (i.e. dichotomize) relevant information to choose a simpler model (i.e. logistic regression) is, in most cases, a bad idea that leads to worse models. Therefore, in this context I would prefer to model a more complex outcome variable such as this four-level approval or a feeling thermometer over the simpler dichotomous variable.
+
+## Predicting States
+
+```{r, cache = TRUE}
+states <- unique(AFS_clean$inputstate)
+
+fill1 <- data.frame(state = states, n = rep(NA, length(states)), 
+                    Pr_Model = rep(NA, length(states)))
+
+for(i in 1:length(states)){
+  rowinfo <- ((lmatrix>0.5)*1)[,AFS_clean$inputstate==states[i]]
+  fill1$n[i] <- ncol(rowinfo)
+  fill1$Pr_Model[i] <- round(sum(rowMeans(rowinfo)>0.4999)/6000, 2)
+}
+
+fill2 <- AFS_clean %>% group_by(inputstate) %>% 
+  summarise(Vote_Share_Data = round(mean(trump_binary), 2)) %>% select(Vote_Share_Data)
+
+fill <- cbind(fill1, fill2)
+```
+
+Note that the predictions are quite imprecise, something that particularly happens in states with a very low sample size.
+
+```{r, cache = TRUE}
+knitr::kable(fill)
+```
+
+For using the posterior predictions instead of the actual reported vote share we need to trust our model to a certain extent (i.e. a very simplistic model will probably not work). However, if the model is relatively good it should offer a clear improvement over the raw data. Note that the advantage of this model-based approach is that we can incorporate much more relevant information, such as past voting behavior, party ID, or the effects of multiple demographics. The use of a multilevel model should be able to also improve the predictions as it is able to partially pool relevant information on the effect of a certain predictor across states. This property makes a better a more effective use of the information in the data than the alternative approach of fitting a separate model for each state -- something that will not even be possible to do in this case given that some states have very few data points.
+
+A further improvement, apart from adding other relevant predictors, will be to include postratification. That is, instead of assuming that the AFS survey is representative for each state, we could use census data to get more realistic estimates.
+
+# Discrimination in Police Stops
+
+## Prior preditive distribution
+
+The model is summarized here for simplicity, and implemented in NC_rng.stan. The code is also shown below.
+
+```{r, cache = TRUE}
+north_carolina <- readRDS("north_carolina.rds")
+```
+
+
+$R_{rd} \sim Binom(q_{rd}, S_{rd})$
+
+* $q_{rd} = \phi_{rd} \frac{1 - \text{dbeta}(t_{rd}, \phi_{rd}, \lambda_{rd}+1)}{\text{dbeta}(t_{rd}, \phi_{rd}, \lambda_{rd}}$ 
+
+$S_{rd} \sim Binom(p_{rd}, n_{rd})$
+
+* $p_{rd} = 1 - \text{dbeta}(t_{rd}, \phi_{rd}, \lambda_{rd})$
+
+  * $t_{rd} \sim logit^{-1}(N(\mu_{tr},\sigma_{tr}))$
+
+    * $\mu_{tr} \sim N(0, 2)$
+
+    * $\sigma_{tr} \sim N_+(0, 2)$
+
+  * $\phi_{rd} = \text{logit}^{-1}(\phi_{r} + \phi_{d})$
+
+    * $\phi_{r} \sim N(\mu_{\phi_{r}}, \sigma_{\phi_{r}})$
+
+        * $\mu_{\phi_{r}} \sim N(0, 2)$
+
+        * $\sigma_{\phi_{r}} \sim N_+(0, 2)$
+        
+    * $\phi_{d} \sim N(\mu_{\phi_{d}}, \sigma_{\phi_{d}})$ or $\phi_{d} = 0$ when $d = 1$
+
+        * $\mu_{\phi_{d}} \sim N(0, 2)$
+
+        * $\sigma_{\phi_{d}} \sim N_+(0, 2)$
+        
+  * $\lambda_{rd} \sim \text{exp}(\lambda_{r} + \lambda_{d})$
+
+    * $\lambda_{r} \sim N(\mu_{\lambda_{r}}, \sigma_{\lambda_{r}})$
+
+        * $\mu_{\lambda_{r}} \sim N(0, 2)$
+
+        * $\sigma_{\lambda_{r}} \sim N_+(0, 2)$
+        
+    * $\lambda_{d} \sim N(\mu_{\lambda_{d}}, \sigma_{\lambda_{d}})$ or $\lambda_{d} = 0$ when $d = 1$
+
+        * $\mu_{\lambda_{d}} \sim N(0, 2)$
+
+        * $\sigma_{\lambda_{d}} \sim N_+(0, 2)$
+        
+Note that the only change from the original model is that, consistent with what we have used previously in class, I'm using $abs(N(0, 2))$ instead of $N_+(0, 2))$ for the variance priors.
+        
+```{r, eval = FALSE}
+functions {
+  int[ , , ] NC_rng(int D, int R, int[] Asian, int[] Black, int[] Hispanic, int[] White) {
+    //matrix[D, R] data_matrix =  append_col(White, Black)
+    int draws[D, R, 2] = rep_array(0, D, R, 2); // initialize with zeros
+    
+    vector[R] phi_r;
+    vector[R] lambda_r;
+    vector[D] phi_d;
+    vector[D] lambda_d;
+    
+    real mu_phi_r = normal_rng(0, 2);
+    real sigma_phi_r = fabs(normal_rng(0, 2));
+    
+    real mu_phi_d = normal_rng(0, 2);
+    real sigma_phi_d = fabs(normal_rng(0, 2));
+    
+    real mu_lambda_r = normal_rng(0, 2);
+    real sigma_lambda_r = fabs(normal_rng(0, 2));
+    
+    real mu_lambda_d = normal_rng(0, 2);
+    real sigma_lambda_d = fabs(normal_rng(0, 2));
+    
+    real mu_t_rd = normal_rng(0, 2);
+    real sigma_t_rd = fabs(normal_rng(0, 2));
+    
+    for (r in 1:R){
+      phi_r[r] = normal_rng(mu_phi_r, sigma_phi_r);
+      lambda_r[r] = normal_rng(mu_lambda_r, sigma_lambda_r);
+    }
+
+    for (d in 1:D){
+      phi_d[d] = normal_rng(mu_phi_d, sigma_phi_d);
+      lambda_d[d] = normal_rng(mu_lambda_d, sigma_lambda_d);
+    }
+    
+    phi_d[1] = 0;
+    lambda_d[1] = 0;
+    
+    for (r in 1:R){
+      for (d in 1:D){
+        real phi_rd = inv_logit(phi_r[r] + phi_d[d]);
+        real lambda_rd = exp(phi_r[r] + phi_d[d]);
+        real t_rd = inv_logit(normal_rng(mu_t_rd, sigma_t_rd));
+        
+        real p_rd = 1 - beta_cdf(t_rd, phi_rd*lambda_rd, (1-phi_rd*lambda_rd));
+        real q_rd;
+        
+        int n_rd;
+        if (r==1)
+            n_rd = Asian[d];
+        else if (r==2)
+            n_rd = Black[d];
+        else if (r==3)
+            n_rd = Hispanic[d];
+        else if (r==4)
+            n_rd = White[d];
+
+        draws[d, r, 1] = binomial_rng(n_rd, p_rd);
+        
+        q_rd = phi_rd*(1 - beta_cdf(t_rd,
+                                    phi_rd*(lambda_rd+1),
+                                    (1-phi_rd*(lambda_rd+1)))) / beta_cdf(t_rd,phi_rd*lambda_rd, (1-phi_rd*lambda_rd));
+        draws[d, r, 2] = binomial_rng(draws[d, r, 1], q_rd);
+        
+      }
+    }
+    
+    return draws;
+  }
+}
+```
+
+```{r, cache = TRUE}
+rstan::expose_stan_functions("NC_rng.stan")
+PPD <- NC_rng(D = nrow(north_carolina), R = ncol(north_carolina), 
+              Asian = north_carolina[ , 1], Black = north_carolina[ , 2], 
+              Hispanic = north_carolina[ , 3], White = north_carolina[ , 4])
+```
+
+To check the implementation we can show the prior predictive distribution for the first department, the Charlotte-Mecklenburg Police Department.
+
+```{r, cache = TRUE}
+north_carolina <- as.data.frame(north_carolina)
+nc_s <- north_carolina
+nc_r <- north_carolina
+
+nc_s$Asian <- unlist(map(map(PPD, 1), 1))
+nc_s$Black <- unlist(map(map(PPD, 2), 1))
+nc_s$Hispanic <- unlist(map(map(PPD, 3), 1))
+nc_s$White <- unlist(map(map(PPD, 4), 1))
+
+nc_r$Asian <- unlist(map(map(PPD, 1), 2))
+nc_r$Black <- unlist(map(map(PPD, 2), 2))
+nc_r$Hispanic <- unlist(map(map(PPD, 3), 2))
+nc_r$White <- unlist(map(map(PPD, 4), 2))
+
+toprint <- rbind(north_carolina[1,], nc_s[1,], nc_r[1,])
+titletoprint <- rownames(toprint)[1]
+rownames(toprint) <- c("Total", "Searches", "Hits")
+print(titletoprint)
+knitr::kable(toprint)
+```
+
+## Legal Analysis
+
+If the legal claim is made against a particular police department, the defense attorney's argument is applicable. Multilevel models can, in theory, partially pool the coefficients towards the population (state) average. However, this effects tends to be small when there is a lot of data available, and in any case a model can be fit for each individual department (no pooling). If I was in this situation I will fit the no pooling models just in case, comparing it to the multilevel model. Again, I expect that in most cases in which the data is rich-enough to make any legal claim the coefficient for the police department in the multilevel and no pooling model would be quite similar.
+
+If the legal claim is made against the state there is no reason to worry about the information pooling across departments, as all of them are in North Carolina. Using a complete pooling model could be a simpler option, but it has the disadvantage of not accounting for the clear hierarchical structure of the data and not providing individual coefficients for each deparment.
+

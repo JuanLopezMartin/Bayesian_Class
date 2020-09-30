@@ -1,0 +1,305 @@
+---
+title: "GR5065 Assignment 6"
+author: "Juan Lopez Martin"
+output: 
+  pdf_document: 
+    latex_engine: pdflatex
+    keep_tex:  true
+    number_sections: yes
+---
+
+```{r, include=FALSE, warning=FALSE}
+library(rstan)
+library(brms)
+library(ggplot2)
+library(dplyr)
+library(haven)
+library(forcats)
+library(purrr)
+library(bridgesampling)
+library(bayesplot)
+
+Sys.setenv(LOCAL_CPPFLAGS = '-march=corei7 -mtune=corei7')
+#rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r, include=FALSE}
+library(knitr)
+
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+
+hook_output <- knit_hooks$get("output")
+knit_hooks$set(output = function(x, options) {
+  lines <- options$output.lines
+  if (is.null(lines)) {
+    return(hook_output(x, options))  # pass to default hook
+  }
+  x <- unlist(strsplit(x, "\n"))
+  more <- "..."
+  if (length(lines)==1) {        # first n lines
+    if (length(x) > lines) {
+      # truncate the output, but add ....
+      x <- c(head(x, lines), more)
+    }
+  } else {
+    x <- c(more, x[lines], more)
+  }
+  # paste these lines together
+  x <- paste(c(x, ""), collapse = "\n")
+  hook_output(x, options)
+})
+``` 
+
+# Coronavirus
+
+## Prior predictive distribution
+
+We start loading the data (code taken from the blog post).
+
+```{r, cache = TRUE, echo=FALSE}
+require(dplyr)
+require(tidyr)
+require(ggplot2)
+require(rstan)
+require(stringr)
+require(lubridate)
+require(bayesplot)
+require(historydata)
+require(readr)
+require(datasets)
+require(extraDistr)
+```
+
+```{r, cache = TRUE, warning=FALSE}
+data(us_state_populations)
+
+state_pop <- filter(us_state_populations,year==2010) %>% 
+  select(state,population)
+
+merge_names <- tibble(state.abb,
+                      state=state.name)
+
+nyt_data <- read_csv("corona_tscs/retrospective_model_paper/us-states.csv") %>% 
+  complete(date,state,fill=list(cases=0,deaths=0,fips=0)) %>% 
+  mutate(month_day=ymd(date)) %>% 
+  group_by(state) %>% 
+    arrange(state,date) %>% 
+  mutate(Difference=cases - dplyr::lag(cases),
+         Difference=coalesce(Difference,0,0)) %>% 
+  left_join(merge_names,by="state")
+
+tests <- read_csv("corona_tscs/retrospective_model_paper/states_daily_4pm_et.csv") %>% 
+  mutate(month_day=ymd(date)) %>% 
+  arrange(state,month_day) %>% 
+  group_by(state) %>% 
+  mutate(tests_diff=total-dplyr::lag(total),
+         cases_diff=positive-dplyr::lag(positive),
+         cases_diff=coalesce(cases_diff,positive),
+         cases_diff=ifelse(cases_diff<0,0,cases_diff),
+         tests_diff=coalesce(tests_diff,total),
+         tests_diff=ifelse(tests_diff<0,0,tests_diff)) %>% 
+  select(month_day,tests="tests_diff",total,state.abb="state")
+
+# merge cases and tests
+
+combined <- left_join(nyt_data,tests,by=c("state.abb","month_day")) %>% 
+  left_join(state_pop,by="state") %>% 
+  filter(!is.na(population))
+
+# add suppression data
+
+emergency <- read_csv("corona_tscs/retrospective_model_paper/state_emergency_wikipedia.csv") %>% 
+  mutate(day_emergency=dmy(paste0(`State of emergency declared`,"-2020")),
+         mean_day=mean(as.numeric(day_emergency),na.rm=T),
+         sd_day=sd(as.numeric(day_emergency),na.rm=T),
+         day_emergency=((as.numeric(day_emergency) - mean_day)/sd_day)) %>% 
+  select(state="State/territory",day_emergency,mean_day,sd_day) %>% 
+  mutate(state=substr(state,2,nchar(state))) %>% 
+  filter(!is.na(day_emergency))
+
+combined <- left_join(combined,emergency,by="state")
+
+# impute data
+
+combined <- group_by(combined,state) %>% 
+  mutate(test_case_ratio=sum(tests,na.rm=T)/sum(Difference,na.rm=T)) %>% 
+  ungroup %>% 
+  mutate(test_case_ratio=ifelse(test_case_ratio<1 | is.na(test_case_ratio),
+                                mean(test_case_ratio[test_case_ratio>1],na.rm=T),test_case_ratio)) %>% 
+  group_by(state) %>% 
+    mutate(tests=case_when(Difference>0 & is.na(tests)~Difference*test_case_ratio,
+                    Difference==0~0,
+                    Difference>tests~Difference*test_case_ratio,
+                    TRUE~tests)) %>% 
+  arrange(state)
+
+# create case dataset
+
+cases_matrix <- select(combined,Difference,month_day,state) %>% 
+  group_by(month_day,state) %>% 
+  summarize(Difference=as.integer(mean(Difference))) %>% 
+  spread(key = "month_day",value="Difference")
+
+cases_matrix_num <- as.matrix(select(cases_matrix,-state))
+
+# create tests dataset
+
+tests_matrix <- select(combined,tests,month_day,state) %>% 
+  group_by(month_day,state) %>% 
+  summarize(tests=as.integer(mean(tests))) %>% 
+  spread(key = "month_day",value="tests")
+
+tests_matrix_num <- as.matrix(select(tests_matrix,-state))
+
+# need the outbreak matrix
+
+outbreak_matrix <- as.matrix(lapply(1:ncol(cases_matrix_num), function(c) {
+  if(c==1) {
+    outbreak <- as.numeric(cases_matrix_num[,c]>0)
+  } else {
+    outbreak <- as.numeric(apply(cases_matrix_num[,1:c],1,function(col) any(col>0)))
+  }
+  tibble(outbreak)
+}) %>% bind_cols)
+
+colnames(outbreak_matrix) <- colnames(cases_matrix_num)
+
+time_outbreak_matrix <- t(apply(outbreak_matrix,1,cumsum))
+
+just_data <- distinct(combined,state,day_emergency,population) %>% arrange(state)
+
+# now give to Stan
+
+ortho_time <- poly(scale(1:ncol(cases_matrix_num)),degree=3)
+
+real_data <- list(time_all=ncol(cases_matrix_num),
+                 num_country=nrow(cases_matrix_num),
+                 country_pop=floor(just_data$population/100),
+                 cases=cases_matrix_num,
+                 ortho_time=ortho_time,
+                 phi_scale=.1,
+                 count_outbreak=as.numeric(scale(apply(outbreak_matrix,2,sum))),
+                 tests=tests_matrix_num,
+                 time_outbreak=time_outbreak_matrix,
+                 suppress=just_data$day_emergency)
+```
+
+For clarity, a summary of the model is shown below. All the parameters in the STAN file correspond to the coefficients shown in this formula. We used tighter priors that the ones proposed in the blog for the coefficients and intercepts. This is particularly relevant for the intercepts, for which the original idea was using a $N(0, 10)$ but for which we expected really low values. 
+
+Note that the model displayed in the paper is lacking the $g(.)$ function in the first formula It is necessary to include it because if not the expected value of the beta distribution would not be restricted between 0 and 1. It also shows the formulas for $q_ct$ and $a_ct$ in a somewhat confusing way, something we correct here to clarify they are proportions over the total population (i.e. what the paper really shows is $q_ct_a$ and $q_ct_a$ which correspond to the total number and not the proportion) and using $I_ct$ as a reference instead of $I_{ct_{a}}$ as it is the quantity we estimate in the first formula.
+
+$$
+Pr(I_{ct}|T=t) \sim Beta(g(\alpha_1 + \alpha_c + \beta_{O1}\sum_{c=1}^{C} \textbf{1}(a_{ct'}>0) \forall t' \in t'<t + \textbf{1}\beta_{S1} + \\
+                        \beta_{I1}t_o + \beta_{I2}t_o^2 + \beta_{I3}t_o^3 + \textbf{1}\beta_{S2}),\phi)
+$$
+
+
+$$
+q_{ct} \sim \frac{BB(c_p,g(\alpha_2 + \beta_qI_{ct}),\phi_q)}{c_p}
+$$
+
+$$
+a_{ct} \sim \frac{BB(q_{ct},g(\alpha_3 + \beta_a I_{ct})),\phi_a)}{c_p}
+$$
+
+We add the prior $q_{ct}/I_{ct} \sim N_{>0.1}(0.15, 0.05)$. That is, we expect the value will be close to 0.15+-0.05 with a lower bound of 0.1. 
+
+```{r, cache = TRUE}
+expose_stan_functions("part1.stan")
+```
+
+```{r, cache = TRUE}
+out <- coronavirus_PPD_rng(time_all=ncol(cases_matrix_num), 
+                           num_country=nrow(cases_matrix_num),
+                           country_pop=floor(just_data$population/100),
+                           cases=cases_matrix_num,
+                           ortho_time=ortho_time,
+                           phi_scale=.1,
+                           count_outbreak=as.numeric(scale(apply(outbreak_matrix,2,sum))),
+                           tests=tests_matrix_num,
+                           # fixed time_outbreak so it works with expose_stan_functions
+                           time_outbreak=lapply(seq_len(nrow(time_outbreak_matrix)), function(i) time_outbreak_matrix[i,]),
+                           suppress=just_data$day_emergency)
+```
+
+The function actually returns three matrices: $I_{ct}$, $q_{ct}$, and $a_{ct}$. We can visualize, for instance, the progression of the first county $I_{ct}$. As the parameters are initialized at random the plot does not gives us much information.
+
+```{r, cache = TRUE, fig.height=3, fig.width=7}
+plot(1:99, out[[1]][1,], 'l')
+```
+
+## Mistakes
+
+I noticed two minor discrepancies: the county-specific intercept $\alpha_c$ is not used when calculating $\mu_{I_{ct}}$ and the jacobian adjustment is added while in the blog he argues this is not necessary. However, this potentially reflects the work-in-progress nature of the model.
+
+However, there is a major contradiction that I do not understand. In the stan code, the  $\mu_{I_{ct}}$ is calculated as expected. Then the $logit^{-1}$ function is used for the $log q_{ct} - log I_{ct}$ comparison. However, this logit-transormed parameter is never used as the mean parameter in a beta distribution with variance $\phi$. Instead, it is inputed directly to calculate $\mu_{q_{ct}}$ and $\mu_{a_{ct}}$, without even being in the model part of the script. Again, I do not find any reason for skipping this step but I may be failing to understand the logic of the model. For me, this should be a quantity to estimate and it should be in the model section, with the $\phi$ being taken into account as it serves to quantify the difference between the $\mu_{I_{ct}}$ and the empirical proportion of infected. This also generates a chaotic notation that can be seen when in the blog plost the $I_{ct}$ (i.e. proportion of infected in a given state at a given time) suddenly becomes $I_{ct_{a}}$ (i.e. number of people infected in a given state at a given time). It is probably easier to only talk about the proportions $I_{ct}$, $q_{ct}$, $a_{ct}$ (as I did in my summary of the model) or the number of people $I_{ct_a}$, $q_{ct_a}$, $a_{ct_a}$, but mixing both can create a lot of confusion.
+
+
+# CES Models
+
+## Stan program
+
+We consider the outcome $Y$ conditional on the variables $K$, $E$, and $A$ and the parameters $\gamma, \delta, \delta_1, \rho, \rho_1, \nu$.
+
+$$
+E(y | K, E, A, \gamma, \delta, \delta_1, \rho, \rho_1, \nu) \sim N(z, \sigma)
+$$
+
+$$
+z = \gamma \bigg[\delta\Big(\delta_1 K^{-\rho_1} + (1-\delta_1)E^{-\rho_1}\Big)^{\rho/\rho_1} + (1-\delta)A^{-\rho} \bigg]^{-\nu/\rho}
+$$
+
+The stan program is attached as file part2.stan. We have used weakly informative priors based on the requirements stated in the CES paper.
+
+## Posterior Distribution
+
+```{r, cache = FALSE}
+data(GermanIndustry, package = "micEconCES")
+GermanIndustry$time <- GermanIndustry$year - 1960
+GermanIndustry <- subset( GermanIndustry, year < 1973 | year > 1975)
+GermanIndustry <- GermanIndustry[ , c("Y", "K", "E", "A")]
+summary(GermanIndustry)
+```
+
+```{r, cache = FALSE}
+germany_data <- list(N = nrow(GermanIndustry), 
+                     y_n = GermanIndustry$Y, 
+                     k_n = GermanIndustry$K, 
+                     e_n = GermanIndustry$E, 
+                     a_n = GermanIndustry$A)
+```
+
+```{r, cache = FALSE}
+fit <- stan(file = 'part2.stan', data = germany_data, iter = 5000, chains = 3, control = list(adapt_delta = 0.999, max_treedepth = 15))
+```
+
+Note the fit does not produce any warnings when increasing the number of iterations, adapting delta and also increasing max_treedepth.
+
+```{r, cache = FALSE}
+fit
+```
+
+```{r, cache = FALSE, warning=FALSE, fig.height=4, fig.width=6}
+fit_mat <- as.matrix(fit)
+mcmc_areas(fit_mat, pars = c("delta", "delta_1", "rho", "nu")) + theme_bw()
+```
+
+```{r, cache = FALSE, warning=FALSE, fig.height=4, fig.width=6}
+mcmc_areas(fit_mat, pars = c("gamma", "rho_1")) + theme_bw()
+```
+
+These values seem plausible and consistent with the tables 1, 2, and 3 of section 5.3. Note there is a strong uncertainty around $\gamma$, $\rho$, and to some extent $\rho_1$.
+
+
+## Comparison to frequentist estimation
+
+The frequentist approach tries to find the parameter values that are most likely to have originated the data according to the model. That is, the approach is based on maximizing the likelihood function. This is relatively easy in some cases, but in others, such as this one, the optimization task becomes really hard as "very different parameter vectors result in very similar values of the objective function". As explained in the quote, this may even imply the optimization to be stuck in local optima instead of the global maximum. Additionally, the complicated geometry of the objective function can, as stated in the homework, invalidate the assumptions that are required for NHST.
+
+The bayesian approach does not have this problem simply because it does not tries to solve an optimization problem. Instead of trying to get a set of point estimates of the parameters, it provides a joint probability distribution for the parameters given the data. That is, it results in a range of possible values for all the parameters in the model. Note that, although a complicated geometry can be troublesome in some cases, HMC is in general well-suited to navigate the posterior distribution. Therefore, the Bayesian approach does not only simplify the identification, but it also provides a useful range of values for the parameters that can help us make better inferences.
+
+Another potential advantage of Bayesian methods comes in the use of priors. In the original CES paper there seems to be a discussion on whether some of the values of the parameters are economically meaningful or not. I'm not familiar with this field of study, but it may be possible that including more informative priors than I did could partially solve this problem. That is, if economic theory proposes some parameter values are more likely than others, this information can be included in the model. Furthermore, relationships between variables (i.e. [quantities of interest](https://statmodeling.stat.columbia.edu/2019/08/23/yes-you-can-include-prior-information-on-quantities-of-interest-not-just-on-parameters-in-your-model/)) can also be informed by priors. Thus, partially pooling towards what we know a priori are reasonable values for the parameters could also be a useful idea in this example. 
+
+
+

@@ -1,0 +1,471 @@
+---
+title: "GR5065 Assignment 4"
+author: "Juan Lopez Martin"
+output: 
+  pdf_document: 
+    latex_engine: pdflatex
+    number_sections: yes
+---
+
+
+```{r, include=FALSE}
+library(rstan)
+library(brms)
+library(ggplot2)
+library(dplyr)
+library(haven)
+library(forcats)
+library(bridgesampling)
+library(bayesplot)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r, include=FALSE}
+library(knitr)
+
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+
+hook_output <- knit_hooks$get("output")
+knit_hooks$set(output = function(x, options) {
+  lines <- options$output.lines
+  if (is.null(lines)) {
+    return(hook_output(x, options))  # pass to default hook
+  }
+  x <- unlist(strsplit(x, "\n"))
+  more <- "..."
+  if (length(lines)==1) {        # first n lines
+    if (length(x) > lines) {
+      # truncate the output, but add ....
+      x <- c(head(x, lines), more)
+    }
+  } else {
+    x <- c(more, x[lines], more)
+  }
+  # paste these lines together
+  x <- paste(c(x, ""), collapse = "\n")
+  hook_output(x, options)
+})
+``` 
+
+# The Impact of Medicaid Expansion on Voter Participation
+
+```{r}
+oregon <- as_factor(read_dta(file.path("19026_supp", "Data", "individual_voting_data.dta")))
+table(oregon$treatment) # this indicates who won the lottery
+```
+
+I'm going to analyze *Table 3 Row 2*. As an initial exploration, I will reproduce the results of columns 2 and 3 in order to check I'm using the correct variables. 
+For column 2, we also get that the control group mean is 22.895.
+
+```{r, cache = TRUE}
+fit <- lm(vote_midterm_2010_2 ~ treatment, data = oregon, weights = weight_nov2010)
+summary(fit)
+```
+
+For column 3, I get the same point estimates. Standard errors are different because I'm not applying the clustering correction.
+
+```{r, cache = TRUE}
+fit <- lm(vote_midterm_2010_2 ~ treatment + nnnnumhh_li_2 + nnnnumhh_li_3 + prevote, data = oregon, weights = weight_nov2010)
+summary(fit)
+```
+
+```{r, cache = TRUE}
+set.seed(1234)
+oregon <- oregon %>% sample_n(10000)
+```
+
+## Monotonic Predictor
+
+```{r, cache = TRUE}
+prior_a <- prior(normal(0.5, 1), class = "Intercept")
+prior_b <- prior(normal(0, 1), class = "b")
+prior_mo <- prior(dirichlet(1, 1), class = "simo", coef = "monumhh_list1")
+```
+
+```{r, cache = TRUE}
+oregon$numhh_list <- factor(oregon$numhh_list, ordered = TRUE, levels = c("signed self up", 
+                                                                          "signed self up + 1 additional person", 
+                                                                          "signed self up + 2 additional people"))
+```
+
+Note that we are ignoring the weights (as suggested by Prof. Goodrich), which could be added with "vote_midterm_2010_2 | weights(weight_nov2010)".
+
+```{r, cache = TRUE}
+prior_a <- prior(normal(0, 5), class = "Intercept")
+prior_b <- prior(normal(0, 2), class = "b")
+prior_mo <- prior(dirichlet(1, 1), class = "simo", coef = "monumhh_list1")
+
+fit_glm <- brm(vote_midterm_2010_2  ~ treatment + mo(numhh_list) + prevote, data = oregon, prior = prior_a + prior_b + prior_mo, chains = 6, cores = 6, iter = 2000, save_all_pars = TRUE, control = list(adapt_delta = 0.9))
+```
+
+```{r, cache = TRUE}
+print(fit_glm, digits = 3)
+```
+
+```{r, fig.width=8, fig.height=4, cache = TRUE, warning=FALSE}
+mcmc_areas(fit_glm, pars = c("b_Intercept", "b_treatment", "bsp_monumhh_list", "b_prevote")) + theme_bw()
+```
+
+The effect of the treatment has an opposite sign relative to what is reported in the paper. I suspect not using the weighting they are using is an important part of the explanation, because when I fitted the exact same model they're fitting with the standanrd lm I obtained the same point estimates with weighting (as shown above), but when ignoring weighting the results indicated a positive effect of the treatment effect instead of negative. 
+
+## Bernoulli likelihood
+
+The results are quite similar to the previous model.
+
+```{r, cache = TRUE}
+fit_ber <- brm(vote_midterm_2010_2 ~ treatment + mo(numhh_list) + prevote, data = oregon, family = bernoulli(link = "logit"), prior = prior_a + prior_b + prior_mo, chains = 6, cores = 6, iter = 2000, save_all_pars = TRUE, control = list(adapt_delta = 0.9))
+```
+
+```{r, cache = TRUE}
+print(fit_ber, digits = 3)
+```
+
+## PSISLOOCV
+
+It seems like the linear regression worked quite better than the logistic regression in this case.
+
+```{r, cache = TRUE}
+loo_glm <- loo(fit_glm)
+loo_glm
+```
+
+```{r, cache = TRUE}
+loo_ber <- loo(fit_ber)
+loo_ber
+```
+
+```{r, cache = TRUE}
+loo_compare(loo_glm, loo_ber)
+```
+
+## Stacking Weights
+
+This function tries to find a combination of models that maximizes ELPD, thus assigning weights (not probabilities) to each model. Note that the first model is given much more weight, something that is consistent with the findings above that suggested that this linear regression performed better than logistic regression.
+
+```{r, cache = TRUE}
+loo_model_weights(list(loo_glm, loo_ber), method = "stacking")
+```
+
+## Posterior Probability Over Models
+
+```{r}
+bridge_glm <- bridge_sampler(fit_glm, silent = TRUE)
+
+bridge_ber <- bridge_sampler(fit_ber, silent = TRUE)
+```
+
+The errors are sufficiently small
+
+```{r, cache = TRUE}
+sapply(list(glm = bridge_glm, ber = bridge_ber), error_measures)
+```
+
+The result of post_prob indicates that, given the (very strong) assumption that one of these two models is right, the linear regression has a probability of 1 being the one which is right. This extreme results highlights what we have found in the previous two questions.
+
+```{r, cache = TRUE}
+post_prob(bridge_glm, bridge_ber)
+```
+
+## Projection Pursuit
+
+After removing the monotonic predictor we get the following model:
+
+```{r, warning=FALSE, cache = TRUE}
+prior_a <- prior(normal(0.5, 1), class = "Intercept")
+prior_b <- prior(normal(0, 1), class = "b")
+
+fit_glm_2 <- brm(vote_midterm_2010_2  ~ treatment + numhh_list + prevote, data = oregon, prior = prior_a + prior_b, chains = 6, cores = 6, iter = 2000, save_all_pars = TRUE, control = list(adapt_delta = 0.9))
+print(fit_glm_2, digits = 2)
+```
+
+```{r, fig.width=8, fig.height=4, cache = TRUE, warning=FALSE}
+mcmc_areas(fit_glm_2, pars = c("b_Intercept", "b_treatment", "b_numhh_list.L", "b_numhh_list.Q", "b_prevote")) + theme_bw()
+```
+
+In general, we almost never want to exclude the treatment variable given that its associated $\beta$ is the main parameter of interest, but in this case we debate whether it should be excluded from a prediction perspective.
+
+FIrst, we see that using projpred reveals that the two numhh parameters can be excluded without almost any increase to the ELPD. Whether we should exclude the treatment variable or not is more open to discussion. one the one hand, the increase in ELPD is quite small with wide SE, something that should not be a surprise given that the prevote parameter is (obviously) strongly related with voting behavior while the treatment is, at least as far as we know, slightly (if at all) related to voting behavior in this particular case. Remember that including the weights even changed the sign of the treatment, probably suggesting its effect is very noisy and unclear. However, even with that small increase in ELPD, the function suggest_size with its defaults parameters recommends keeping it.
+
+```{r, fig.width=8, fig.height=5, cache = TRUE, results = 'hide'}
+library(projpred)
+cvs <- cv_varsel(fit_glm_2, method = "forward", nloo = 100)
+```
+
+```{r, fig.width=8, fig.height=5, cache = TRUE}
+varsel_plot(cvs, stats = c('elpd', 'rmse'), deltas = TRUE)
+```
+
+```{r, cache = TRUE}
+cvs
+```
+
+```{r, cache = TRUE}
+suggest_size(cvs)
+```
+
+Note that, even if we keep it, the coefficient is very close to zero and relatively noisy. This is consistent with finding in the paper that this coefficient is not statistically significant, although in this case (i.e. with this particular subset of the data and having removed the other parameters) it turns out that its CI barely excludes 0.
+
+```{r, fig.width=5, fig.height=3, warning=FALSE, cache = TRUE}
+newfit <- project(cvs, nv = 2)
+mcmc_areas(as.matrix(newfit)) + theme_bw() + geom_vline(aes(xintercept = 0))
+```
+
+```{r, fig.width=5, fig.height=3, warning=FALSE, cache = TRUE}
+mean(as.matrix(newfit)[,"treatment"]) - 2*sd(as.matrix(newfit)[,"treatment"])
+mean(as.matrix(newfit)[,"treatment"]) + 2*sd(as.matrix(newfit)[,"treatment"])
+```
+
+
+## Unbiasedness
+
+The frequentist approaches have placed great emphasis on unbiasedness as a desirable principle of parameter estimation. It is quite intuitive that, over repeated sampling, the mean of a parameter estimate should be equal to its true value. This motivates the reasoning in the paragraph, arguing that the least squares estimator will tend to be better in that case as it is unbiased, while a logit or probit model is not. However, in practical terms there are some complications with this reasoning.
+
+* First, it is obvious that in all cases we have only a finite sample, something that is particularly problematic when having small sample sizes. When having a finite sample size, it is in many cases good to use a particular modelling approach that, even if biased, offers a more realistic model that performs better (i.e. reduces variance). Therefore, in some cases we may want to use a logit/probit model instead of the least squares estimator, as the logit/probit function offers a reasonable (although potentially biased) approach that maps the result of a linear model to the estimated probabilities associated with a of a Bernoulli-distributed outcome. This is also the principle behind the use of regularization, which introduces bias in exchange for a reduced variance. In the Bayesian context, this is also the role of priors, include relevant information that can improve performance at the cost of making the modelling biased.  
+* Furthermore, in multiparameter models (which are almost all of the models used in practice) it is not possible to estimate all the parameters in an even unbiased manner – commonly leading to an overly optimistic estimate of the variances of the parameters. Bayesian modelling is able to propagate uncertainty very effectively, and therefore is preferred to avoid this problem.
+
+In sum, I think it is reasonable to say that the importance of unbiased models has been, in general, overstated. As we often have limited data to estimate multiparameter models, we may trade unbiasedness for the benefit of including prior information in the priors and/or in the model form, the use of regularization, and the propagation of uncertainty – something that will ultimately lead to a better modelling. 
+
+
+
+# General Social Survey
+
+```{r, cache = TRUE}
+GSS <- as_factor(read_dta("GSS2018.dta"))
+```
+
+```{r, cache = TRUE}
+GSS_clean <- GSS %>% select(age, race, sex, educ, partyid, relig, godswill) %>% 
+  mutate(relig = factor(replace(relig, relig %in% c("NA", "DK", "IAP"), NA)),
+         age = as.numeric(replace(age, age %in% c("NA", "DK", "IAP"), NA)),
+         race = factor(replace(race, race %in% c("NA", "DK", "IAP"), NA)),
+         sex = factor(replace(sex, sex %in% c("NA", "DK", "IAP"), NA)),
+         educ = as.numeric(replace(educ, educ %in% c("na", "dk", "iap"), NA)),
+         partyid = as.integer(factor(partyid, ordered = TRUE, levels = c("strong democrat",
+                                                                          "not str democrat",
+                                                                          "ind, near dem",
+                                                                          "independent",
+                                                                          "ind, near rep",
+                                                                          "not str republican", 
+                                                                          "strong republican"))),
+         godswill = factor(godswill, ordered = TRUE, levels = c("not at all likely",
+                                                                "not very likely",
+                                                                "somewhat likely",
+                                                                "very likely"))) %>% 
+           mutate(relig = relevel(factor(replace(relig, !(relig %in% c("protestant", "catholic", "none")), "other")), ref = "none"))
+
+```
+
+One interesting section of the 2018 GSS narrated a mental-health related situation that an individual had suffered The identity of the person was randomly sampled (changing his/her name, gender, race, education), and so was the topic of the narration (alcohol dependence, major depression, schizofrenia, drug problem, or no problem). An example is shown below:
+
+\[John/Juan/Mary/Maria\] is a \[white/African American/Hispanic\] \[man/woman\] who has completed an \[eighth grade/high school/college\]. About a year ago
+\[John/Juan/Mary/Maria\] was prescribed prescription pain medication for back pain s/he developed folling a car accident. S/He took the pain medication
+regularly, and after a few weeks found that s/he increasingly felt the desire for more, even though his/her back pain had improved. [John/Juan/Mary/Maria]
+went to several different doctors to get more prescriptions from them and then started getting them from a friend. Each time [John/Juan/Mary/Maria] tried
+to cut down, s/he felt anxious and became sweaty and nauseated for hours on end and also could not sleep. These symptoms lasted until s/he resumed
+taking the prescription pain medication. \[John/Juan/Mary/Maria\]'s friends complained that s/he had become unreliable - making plans one day, and cancelling
+the next. His/Her family said s/he had changed and they could no longer count on him/her. \[John/Juan/Mary/Maria\] has been livng this way for six months
+
+A series of questions concerning the cause of the negative situation followed the narration. For instance, it asked about the potential effects of \[John's/Juan's/Mary's/Maria's\] bad character, brain chemical imbalances, or the way she was raised on his/her problem. A particularly interesting cause for which the survey asked was the potential effect of God's will in the problem. The specific question was: In your opinion, how likely is it that NAME's situation might be caused by God's will [(1) not at all likely, (2) not very likely, (3) somewhat likely, (4) very likely]. Historically, mental health problemas have been framed, in many cases, as particuarly related to supernatural forces. To my surprise, the categories (2), (3), and (4) were more frequently used than I expected -- although, being, still, a minority relative to the responses to the first level. 
+
+```{r, fig.width=5, fig.height=3, cache = TRUE}
+hist(as.numeric(GSS_clean$godswill))
+```
+
+My goal, therefore, was to explain the potential characteristics that are associated with these responses. Being the variable godswill the outcome, I started including as predictors age, gender (male/female), and race (white/black/other). I also included age^2, in case it could detect any nonlinearity in the relationship. Additionally, I included education level (years of education), religion (none/protestant/catholic/other) and party leaning (Democrat_republican). Note that religion was included as a categorical variable, while party ID was converted to an ordinal variable. My expectation was that age, religion, and party were positively related to the belief in God's will, while education was expected to be negatively related.
+
+Note that not all individuals in the dataset got asked all the questions or gave valid responses, which gives a dataset with only 781 rows. I would have liked to include a variable that referred to trust in science. Multiple variables in the dataset exist that measure similar concepts, but all of them were asked for people for which the God's will question was not presented. Therefore, I finally couldn't include it. 
+
+```{r, warning=FALSE, cache = TRUE}
+GSS_clean %>% na.omit() %>% nrow()
+```
+
+## Prior predictive distribution
+
+```{r, warning=FALSE, cache = TRUE}
+prior_fit <- brm(godswill ~ age + I(age^2) + educ + sex + partyid + race + relig, data = GSS_clean, family = cumulative(link = "logit"),
+           prior = prior(normal(0, 5), class = "Intercept") + prior(normal(0, 2), class = "b"), sample_prior = "only")
+```
+
+```{r, cache = TRUE}
+print(prior_fit, digits = 2)
+```
+
+## Posterior Distribution
+
+```{r, cache = TRUE}
+fit <- brm(godswill ~ age + I(age^2) + educ + sex + partyid + race + relig, data = GSS_clean, family = cumulative(link = "logit"),
+           prior = prior(normal(0, 5), class = "Intercept") + prior(normal(0, 2), class = "b"))
+```
+
+```{r, cache = TRUE}
+print(fit, digits = 2)
+```
+
+* Surprisingly, age does not have a strong effect, and it is even in the opposite direction as what I would have expected. Moreover, the coefficient is Age^2 with a large standard error and should probably be removed from subsequent models.
+* As expected, education had a strong negative effect. Effects are relatively difficult to interpret in ordinal regression, but we will try to present it in an intuitive way. Let's start comparing, under the model, two people that have the average age, median political ideology, and that are both white protestant males, but that the first has average education and the second has one year more of education more than the first. Comparing these two individuals, the model expects the latter will have 2.7% more probability of responding with level 1 ("not at all likely"), 1.4% less chances of indicating level 2 ("not very likely"), 0.9% lower probability of indiciating level 3 ("somewhat likely"), and 0.4% smaller chances of selecting level 4 ("very likely") compared with the former. Overall, we see that a one year of extra education with respect to the average decreases the chances of believing in God's will. However, that results from a particular comparison
+between white protestant males. To get a more general idea, we will also study the effect of education expected by the model when comparing white female catholics with a white female catholics, black male protestants with black male protestants. For each of these comparisons we don't only get the estimated difference in probabilities, but the uncertainty that accompanies it (which we will ignore from simplicity). Averaging over these possibilites (note: for simplicity, we have excluded the case in which religion or race is 'other'), we get that one extra year of education with respect to the average increases the probabilities of by indicating level 1 by 1.4%, decreases the chances of level 2 by 1.1%, the probabilities of level 3 are decreased by 1.0%, and the chances of level 4 are reduced by 0.5%. To avoid wordiness, from now on we will refer to these differences as (1) 2.7% (2) -1.1% (3) -1.0% (4) -0.5%.
+* Race seems to a have a strong effect. Although participants that indicated their race as 'other' do not show a consisent effect, people who identified as black did. Compared with whites (the baseline), more likely to believe in God's will as a cause of negative events, on average over all the comparisons we considered (and according to the model), (1) -16.0%, (2) 6.6%, (3) 6.3%, (4) 3.1%.
+* Being female does not appear to have a consisent effect, presenting a noisy estimate.
+* Party ID appears to suggest that being republican seems to be associated with a hgiher probability of agreeing with the God's will explanation. We obtain that an individual that is one extra level relative to the median (the median in the dataset is being independent, so one extra level means having indicated a preference of "independent, near rep") have, according to the model (1) -1.7% (2) 0.6 (3) 0.7 (4) 0.4 probabilities relative to a person in the median.
+* Religion, surprisingly, did not had an effect as strong as expected, with a quite noisy estimate for both protestants [(1) -17.0 (2) 8.5 (3) 5.8 (4) 2.7] and catholics [(1) -17 (2) 8 (3) 6 (4) 3]. As expected, the cathegory that grouped other religions obtained a noisy estimate. Given that the sample size is not that big, that most people had responded with category one, and the similarity between the protestants and catholics, we could probably merge the two categories in subsequent models if we were interested in the effect of christianity on belief in God's will.
+
+In general, it appears that all the effects that appear to be clearly consistent with the data were in the expected direction. However, further research should be done to clarify the strength of these and, potentially, to include other predictors. 
+
+```{r, cache = TRUE}
+# Diferences by educ
+
+dif1 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif2 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif3 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+dif4 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+dif5 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4)
+
+dif6 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4)
+
+dif7 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4)
+
+dif8 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE)+1, sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4)
+
+round(colMeans(rbind(apply(dif1, 2, mean), apply(dif2, 2, mean), apply(dif3, 2, mean), apply(dif4, 2, mean),
+                     rbind(apply(dif5, 2, mean), apply(dif6, 2, mean), apply(dif7, 2, mean), apply(dif8, 2, mean)))*100), 1)
+
+rbind(Est_dif = round(apply(dif1, 2, mean)*100, 2), SE = round(apply(dif1, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif2, 2, mean)*100, 2), SE = round(apply(dif2, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif3, 2, mean)*100, 2), SE = round(apply(dif3, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif4, 2, mean)*100, 2), SE = round(apply(dif4, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif5, 2, mean)*100, 2), SE = round(apply(dif5, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif6, 2, mean)*100, 2), SE = round(apply(dif6, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif7, 2, mean)*100, 2), SE = round(apply(dif7, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif8, 2, mean)*100, 2), SE = round(apply(dif8, 2, sd)*100, 2))
+
+```
+
+```{r, cache = TRUE}
+# Diferences by race
+
+dif1 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif2 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif3 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+dif4 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+
+round(colMeans(rbind(apply(dif1, 2, mean), apply(dif2, 2, mean), apply(dif3, 2, mean), apply(dif4, 2, mean)))*100, 1)
+
+rbind(Est_dif = round(apply(dif1, 2, mean)*100, 2), SE = round(apply(dif1, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif2, 2, mean)*100, 2), SE = round(apply(dif2, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif3, 2, mean)*100, 2), SE = round(apply(dif3, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif4, 2, mean)*100, 2), SE = round(apply(dif4, 2, sd)*100, 2))
+
+```
+
+```{r, cache = TRUE}
+# Diferences by partyid
+
+dif1 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif2 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4)
+
+dif3 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+dif4 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = mean(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4)
+
+dif5 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4)
+
+dif6 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4)
+
+dif7 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4)
+
+dif8 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE)+1, race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4)
+
+round(colMeans(rbind(apply(dif1, 2, mean), apply(dif2, 2, mean), apply(dif3, 2, mean), apply(dif4, 2, mean),
+                     rbind(apply(dif5, 2, mean), apply(dif6, 2, mean), apply(dif7, 2, mean), apply(dif8, 2, mean)))*100), 2)
+
+rbind(Est_dif = round(apply(dif1, 2, mean)*100, 2), SE = round(apply(dif1, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif2, 2, mean)*100, 2), SE = round(apply(dif2, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif3, 2, mean)*100, 2), SE = round(apply(dif3, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif4, 2, mean)*100, 2), SE = round(apply(dif4, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif5, 2, mean)*100, 2), SE = round(apply(dif5, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif6, 2, mean)*100, 2), SE = round(apply(dif6, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif7, 2, mean)*100, 2), SE = round(apply(dif7, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif8, 2, mean)*100, 2), SE = round(apply(dif8, 2, sd)*100, 2))
+
+```
+
+
+```{r, cache = TRUE}
+# Diferences by protestant
+
+dif1 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif2 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif3 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif4 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("protestant"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+round(colMeans(rbind(apply(dif1, 2, mean), apply(dif2, 2, mean), apply(dif3, 2, mean), apply(dif4, 2, mean)))*100, 1)
+
+rbind(Est_dif = round(apply(dif1, 2, mean)*100, 2), SE = round(apply(dif1, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif2, 2, mean)*100, 2), SE = round(apply(dif2, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif3, 2, mean)*100, 2), SE = round(apply(dif3, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif4, 2, mean)*100, 2), SE = round(apply(dif4, 2, sd)*100, 2))
+
+```
+
+```{r, cache = TRUE}
+# Diferences by catholic
+
+dif1 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif2 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif3 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("male"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+dif4 <- matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("black"), relig = factor("catholic"))), 4000, 4) - matrix(pp_expect(fit, newdata = data.frame(age = mean(GSS_clean$age, na.rm = TRUE), educ = mean(GSS_clean$educ, na.rm = TRUE), sex = factor("female"), partyid = median(GSS_clean$partyid, na.rm = TRUE), race = factor("white"), relig = factor("none"))), 4000, 4)
+
+round(colMeans(rbind(apply(dif1, 2, mean), apply(dif2, 2, mean), apply(dif3, 2, mean), apply(dif4, 2, mean)))*100)
+
+rbind(Est_dif = round(apply(dif1, 2, mean)*100, 2), SE = round(apply(dif1, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif2, 2, mean)*100, 2), SE = round(apply(dif2, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif3, 2, mean)*100, 2), SE = round(apply(dif3, 2, sd)*100, 2))
+rbind(Est_dif = round(apply(dif4, 2, mean)*100, 2), SE = round(apply(dif4, 2, sd)*100, 2))
+
+```
+
+```{r, cache = TRUE}
+pairs(fit, pars = c("partyid", "religprotestant", "religcatholic", "raceblack"))
+```
+
+We fit a new model removind the quadratic term for age and merging protestant and catholic categories. Note how age appears to be negatively related to beliving in God's will, something I did not expect and that should require further investigaion. In general, I think this second model is easier to interpret, but for the posterior predictive check in the next section we will maintain the first model as the rubric only asked for one model.
+
+```{r, warning=FALSE, cache = TRUE}
+GSS_clean$relig <- forcats::fct_collapse(GSS_clean$relig, christian = c("protestant", "catholic"))
+
+fit2 <- brm(godswill ~ age + educ + sex + partyid + race + relig, data = GSS_clean, family = cumulative(link = "logit"),
+           prior = prior(normal(0, 5), class = "Intercept") + prior(normal(0, 2), class = "b"))
+```
+
+```{r, cache = TRUE}
+print(fit2, digits = 3)
+```
+
+I also fitted a model with an interaction, but it was too noisy. More data will be needed if we were interested in interactions.
+
+## Posterior Predictive Check
+
+The posterior predictive check seems to imply the model fits the data well.
+
+```{r, fig.width=5, fig.height=3, cache = TRUE}
+pp_check(fit, plotfun = "ppc_bars")
+```
+
